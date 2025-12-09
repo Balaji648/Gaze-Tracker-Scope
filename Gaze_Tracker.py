@@ -996,7 +996,7 @@ class SmoothGazeTracker:
             f"Cursor Sentivity: {self.config.CURSOR_SENSITIVITY}",
             f"CPU: {system_stats['cpu_percent']}%",
             f"RAM: {system_stats['memory_used_mb']}MB ({system_stats['memory_percent']}%)",
-            f"Calibration: B-Blink,O-ok",
+            f"Calibration: C, B-Blink, O-ok",
             f"Quit: Q , Reset calibration: R ", 
             f"Sensitivity: + = increment , - = decrement",
         ]
