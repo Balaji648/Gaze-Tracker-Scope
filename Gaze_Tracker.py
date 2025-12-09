@@ -1,4 +1,4 @@
-#gaze_tracker.py
+# updated_gaze_tracker.py
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -438,55 +438,87 @@ class SmoothGazeTracker:
         # Set up an OpenCV window mouse callback (will be configured at runtime)
         self.window_name = 'Smooth Gaze Tracking - Press Q to quit'
 
+    # ----- Mouse helpers -----
+    def _global_mouse_callback(self, event, x, y, flags, param):
+        """Persistent mouse callback used for OK-button clicks and other interactions."""
+        if event == cv2.EVENT_LBUTTONDOWN:
+            # store click coordinates and time
+            self.mouse_last_click = (x, y, time.time())
+
+    def set_mouse_callback(self, window_name):
+        """Attach persistent mouse callback to window."""
+        cv2.setMouseCallback(window_name, self._global_mouse_callback)
+
     # ----- Screen boundary utilities -----
     def start_screen_boundary_setup(self, cap):
         """
         Shows current frame and allows the user to click four corners of the screen in order:
         top-left, top-right, bottom-right, bottom-left.
         Stores normalized coordinates in self.screen_corners.
+        This function restores the persistent mouse callback at the end so OK-mode works afterwards.
         """
         print("Screen boundary setup: click the 4 corners of your laptop screen in order: TL, TR, BR, BL.")
         print("Press 's' to cancel. Close window to finish.")
         clicked = []
 
-        # temporary callback to collect clicks
-        def on_mouse(event, x, y, flags, param):
+        # temporary callback to collect clicks for boundary setup
+        def temp_on_mouse(event, x, y, flags, param):
             if event == cv2.EVENT_LBUTTONDOWN:
                 clicked.append((x, y))
-                print(f"Clicked: {x}, {y}")
+                print(f"Clicked corner: {x}, {y}")
 
-        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-        cv2.setMouseCallback(self.window_name, on_mouse)
+        # attach temp callback
+        cv2.setMouseCallback(self.window_name, temp_on_mouse)
         start_t = time.time()
-        while True:
-            ret, frame = cap.read()
-            if not ret:
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    print("Failed to read frame during corner setup.")
+                    break
+
+                # draw clicked points
+                for i, (cx, cy) in enumerate(clicked):
+                    cv2.circle(frame, (int(cx), int(cy)), 8, (0, 255, 255), -1)
+                    cv2.putText(frame, str(i + 1), (int(cx) - 10, int(cy) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+
+                cv2.putText(frame, "Click 4 corners: TL, TR, BR, BL", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+                cv2.imshow(self.window_name, frame)
+                k = cv2.waitKey(20) & 0xFF
+                if k == ord('s'):
+                    print("Screen boundary setup cancelled by user.")
+                    return False
+                # If 4 clicks, accept
+                if len(clicked) >= 4:
+                    h, w = frame.shape[:2]
+                    # convert to normalized coords in same order clicked
+                    norm = [(cx / w, cy / h) for (cx, cy) in clicked[:4]]
+                    self.screen_corners = norm
+                    print("Screen corners saved (normalized):", self.screen_corners)
+                    return True
+
+                # safety timeout 60s
+                if time.time() - start_t > 60:
+                    print("Screen boundary setup timed out.")
+                    return False
+        finally:
+            # restore the persistent mouse callback so OK-button clicks work
+            # This ensures we don't leave the callback disabled
+            self.set_mouse_callback(self.window_name)
+
+    def ensure_screen_corners_blocking(self, cap):
+        """
+        Called at startup to force the user to set corners. Loops until user sets corners or raises KeyboardInterrupt.
+        """
+        while self.screen_corners is None:
+            print("\n==> Screen corners are required before continuing.")
+            success = self.start_screen_boundary_setup(cap)
+            if success:
+                print("Screen corners set. Continuing.")
                 break
-            # draw clicked points
-            for i, (cx, cy) in enumerate(clicked):
-                cv2.circle(frame, (int(cx), int(cy)), 8, (0, 255, 255), -1)
-                cv2.putText(frame, str(i + 1), (int(cx) - 10, int(cy) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-
-            cv2.imshow(self.window_name, frame)
-            k = cv2.waitKey(20) & 0xFF
-            if k == ord('s'):  # cancel
-                print("Screen boundary setup cancelled.")
-                cv2.setMouseCallback(self.window_name, lambda *args: None)
-                return False
-            # If 4 clicks, accept
-            if len(clicked) >= 4:
-                h, w = frame.shape[:2]
-                norm = [(cx / w, cy / h) for (cx, cy) in clicked[:4]]
-                self.screen_corners = norm
-                print("Screen corners saved (normalized):", self.screen_corners)
-                cv2.setMouseCallback(self.window_name, lambda *args: None)
-                return True
-
-            # safety timeout 60s
-            if time.time() - start_t > 60:
-                print("Screen boundary setup timed out.")
-                cv2.setMouseCallback(self.window_name, lambda *args: None)
-                return False
+            else:
+                print("Screen corners not set. You can retry. (Press Ctrl+C to abort.)")
+                time.sleep(0.5)  # tiny pause before retry
 
     def map_normalized_to_screen(self, nx, ny):
         """
@@ -612,13 +644,6 @@ class SmoothGazeTracker:
         # Empirically, a small ratio indicates closed eye; threshold adjustable
         return ratio < 0.25
 
-    # ----- Mouse handler for OK button / clicks -----
-    def set_mouse_callback(self, window_name):
-        def on_mouse(event, x, y, flags, param):
-            if event == cv2.EVENT_LBUTTONDOWN:
-                self.mouse_last_click = (x, y, time.time())
-        cv2.setMouseCallback(window_name, on_mouse)
-
     # ----- Main processing -----
     def process_frame(self, frame):
         """Process frame with normal smooth tracking"""
@@ -712,70 +737,77 @@ class SmoothGazeTracker:
                     gaze_x, gaze_y = self.smoothed_gaze_x, self.smoothed_gaze_y
 
             if self.calibrating:
+                # safety: ensure index is valid
+                if self.current_calibration_point < 0 or self.current_calibration_point >= len(self.config.CALIBRATION_POINTS):
+                    self.current_calibration_point = 0
+
                 cur_pt = self.config.CALIBRATION_POINTS[self.current_calibration_point]
 
                 # If just started this point
                 if self.samples_collected_current_point == 0 and self.calibration_point_start_time == 0.0:
-                                self.calibration_point_start_time = time.time()
-                                print(f"Calibration point {self.current_calibration_point + 1} started.")
+                    self.calibration_point_start_time = time.time()
+                    print(f"Calibration point {self.current_calibration_point + 1} started.")
 
                 trigger_detected = False
 
                 # Detect trigger
                 if self.calibration_mode == 'blink':
-                                blinked_left = self.detect_blink(left_eye)
-                                blinked_right = self.detect_blink(right_eye)
-                                now = time.time()
-                                if (blinked_left or blinked_right) and (now - self.last_blink_time) > self.blink_cooldown:
-                                                trigger_detected = True
-                                                self.last_blink_time = now
+                    blinked_left = self.detect_blink(left_eye)
+                    blinked_right = self.detect_blink(right_eye)
+                    now = time.time()
+                    if (blinked_left or blinked_right) and (now - self.last_blink_time) > self.blink_cooldown:
+                        trigger_detected = True
+                        self.last_blink_time = now
 
                 elif self.calibration_mode == 'ok':
-                                if self.mouse_last_click:
-                                                mx, my, tclick = self.mouse_last_click
-                                                self.mouse_last_click = None
-                                                if self.ok_button_rect:
-                                                                x1, y1, x2, y2 = self.ok_button_rect
-                                                                if x1 <= mx <= x2 and y1 <= my <= y2:
-                                                                                trigger_detected = True
+                    # mouse_last_click should be (x,y,t)
+                    if self.mouse_last_click:
+                        mx, my, tclick = self.mouse_last_click
+                        # consume click so it doesn't trigger multiple times
+                        self.mouse_last_click = None
+                        if self.ok_button_rect:
+                            x1, y1, x2, y2 = self.ok_button_rect
+                            if x1 <= mx <= x2 and y1 <= my <= y2:
+                                trigger_detected = True
 
                 # Only start collecting if a trigger is detected
                 if trigger_detected:
-                                self.collecting_samples = True
-                                self.samples_to_collect = self.config.CALIBRATION_SAMPLES_PER_POINT - self.samples_collected_current_point
-                                self.sample_collection_start_time = time.time()
-                                print(f"Trigger detected! Collecting {self.samples_to_collect} samples for point {self.current_calibration_point + 1}")
+                    self.collecting_samples = True
+                    self.samples_to_collect = self.config.CALIBRATION_SAMPLES_PER_POINT - self.samples_collected_current_point
+                    self.sample_collection_start_time = time.time()
+                    print(f"Trigger detected! Collecting {self.samples_to_collect} samples for point {self.current_calibration_point + 1}")
 
                 # Collect samples continuously, only if triggered
                 if getattr(self, 'collecting_samples', False) and self.samples_to_collect > 0:
-                                now = time.time()
-                                # Control sampling interval (e.g., 50ms)
-                                if now - self.sample_collection_start_time >= 0.05:
-                                                self.calibrator.add_calibration_sample((raw_gaze_x, raw_gaze_y), cur_pt)
-                                                self.samples_collected_current_point += 1
-                                                self.samples_to_collect -= 1
-                                                self.sample_collection_start_time = now
-                                                print(f"Collected sample {self.samples_collected_current_point}/{self.config.CALIBRATION_SAMPLES_PER_POINT} for point {self.current_calibration_point + 1}")
+                    now = time.time()
+                    # Control sampling interval (e.g., 50ms)
+                    if now - self.sample_collection_start_time >= 0.05:
+                        self.calibrator.add_calibration_sample((raw_gaze_x, raw_gaze_y), cur_pt)
+                        self.samples_collected_current_point += 1
+                        self.samples_to_collect -= 1
+                        self.sample_collection_start_time = now
+                        print(f"Collected sample {self.samples_collected_current_point}/{self.config.CALIBRATION_SAMPLES_PER_POINT} for point {self.current_calibration_point + 1}")
 
-                                # Once all samples collected for current point
-                                if self.samples_to_collect <= 0:
-                                                self.collecting_samples = False
-                                                self.sample_collection_start_time = 0.0
-                                                # Move to next point
-                                                if self.samples_collected_current_point >= self.config.CALIBRATION_SAMPLES_PER_POINT:
-                                                                self.current_calibration_point += 1
-                                                                self.samples_collected_current_point = 0
-                                                                self.calibration_point_start_time = 0.0
-                                                                if self.current_calibration_point >= len(self.config.CALIBRATION_POINTS):
-                                                                                self.calibrating = False
-                                                                                success = self.calibrator.compute_calibration_model()
-                                                                                if success:
-                                                                                                print("Calibration completed successfully!")
-                                                                                else:
-                                                                                                print("Calibration failed. Please try again.")
-                                                                else:
-                                                                                print(f"Moving to calibration point {self.current_calibration_point + 1}")
-
+                    # Once all samples collected for current point
+                    if self.samples_to_collect <= 0:
+                        self.collecting_samples = False
+                        self.sample_collection_start_time = 0.0
+                        # Move to next point
+                        if self.samples_collected_current_point >= self.config.CALIBRATION_SAMPLES_PER_POINT:
+                            self.current_calibration_point += 1
+                            self.samples_collected_current_point = 0
+                            self.calibration_point_start_time = 0.0
+                            # reset ok button rect so next point will create new coordinates
+                            self.ok_button_rect = None
+                            if self.current_calibration_point >= len(self.config.CALIBRATION_POINTS):
+                                self.calibrating = False
+                                success = self.calibrator.compute_calibration_model()
+                                if success:
+                                    print("Calibration completed successfully!")
+                                else:
+                                    print("Calibration failed. Please try again.")
+                            else:
+                                print(f"Moving to calibration point {self.current_calibration_point + 1}")
 
                 # Timeout handling for current point
                 elif time.time() - self.calibration_point_start_time > self.config.CAL_POINT_TIMEOUT:
@@ -907,6 +939,7 @@ class SmoothGazeTracker:
                         by1 = point_y - 20
                         bx2 = bx1 + btn_w
                         by2 = by1 + btn_h
+                        # Save OK rect in current frame pixel coordinates
                         self.ok_button_rect = (bx1, by1, bx2, by2)
                         cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 200, 0), -1)
                         cv2.putText(frame, "OK", (bx1 + 30, by1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
@@ -951,9 +984,8 @@ class SmoothGazeTracker:
         if self.screen_corners:
             pts = np.array([[int(x * w), int(y * h)] for (x, y) in self.screen_corners], np.int32)
             cv2.polylines(frame, [pts], isClosed=True, color=(255, 255, 0), thickness=2)
-        
 
-        
+
         # Information display with system metrics
         info_lines = [
             f"FPS: {self.fps:.1f}",
@@ -963,7 +995,10 @@ class SmoothGazeTracker:
             f"Mode: {self.calibration_mode}",
             f"Cursor Sentivity: {self.config.CURSOR_SENSITIVITY}",
             f"CPU: {system_stats['cpu_percent']}%",
-            f"RAM: {system_stats['memory_used_mb']}MB ({system_stats['memory_percent']}%)"
+            f"RAM: {system_stats['memory_used_mb']}MB ({system_stats['memory_percent']}%)",
+            f"Calibration: B-Blink,O-ok",
+            f"Quit: Q , Reset calibration: R ", 
+            f"Sensitivity: + = increment , - = decrement",
         ]
 
         if self.calibrating:
@@ -980,6 +1015,11 @@ class SmoothGazeTracker:
 
     def start_calibration(self):
         """Start calibration process (event-based)."""
+        # Prevent calibration if corners not set
+        if self.screen_corners is None:
+            print("Screen corners not set. Please set corners first (press 's' to start corner setup).")
+            return
+
         self.calibrator.start_calibration()
         self.calibrating = True
         self.current_calibration_point = 0
@@ -1031,7 +1071,17 @@ def run_smooth_gaze_tracking():
     # Prepare window and callback for OK button and clicks
     window_name = gaze_tracker.window_name
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    # set persistent mouse callback (needed for OK-clicks)
     gaze_tracker.set_mouse_callback(window_name)
+
+    # Enforce mandatory screen corner setup before continuing
+    try:
+        gaze_tracker.ensure_screen_corners_blocking(cap)
+    except KeyboardInterrupt:
+        print("User aborted corner setup. Exiting.")
+        cap.release()
+        cv2.destroyAllWindows()
+        return
 
     print("\n" + "=" * 60)
     print("GAZE TRACKING WITH SCREEN BOUNDARY, 9-POINT CALIBRATION & SENSITIVITY")
