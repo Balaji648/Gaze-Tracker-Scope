@@ -15,6 +15,8 @@ import csv
 import os
 import psutil
 import threading
+import sys
+import traceback
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.pipeline import Pipeline
@@ -63,6 +65,78 @@ class GazeConfig:
     ENABLE_LOGGING = True
     LOG_DIR = "gaze_logs"
 config = GazeConfig()
+
+class JSONLogFormatter(logging.Formatter):
+    """Custom JSON formatter for debug logs"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        log_entry = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "module": record.module,
+            "function": record.funcName,
+            "line": record.lineno,
+        }
+
+        # Add exception info if present
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
+
+        return json.dumps(log_entry, ensure_ascii=False)
+
+
+def setup_debug_logger(cfg):
+    logger = logging.getLogger("GazeTrackerDebug")
+    logger.setLevel(logging.DEBUG)
+
+    if logger.handlers:
+        return logger
+
+    os.makedirs(cfg.LOG_DIR, exist_ok=True)
+
+    # ---------- Text formatter ----------
+    text_formatter = logging.Formatter(
+        "[%(asctime)s] [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    # ---------- Console handler ----------
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.DEBUG)
+    ch.setFormatter(text_formatter)
+
+    # ---------- Text debug file ----------
+    text_log_file = os.path.join(
+        cfg.LOG_DIR,
+        f"gaze_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    )
+    fh_text = logging.FileHandler(text_log_file, encoding="utf-8")
+    fh_text.setLevel(logging.DEBUG)
+    fh_text.setFormatter(text_formatter)
+
+    # ---------- JSON debug file (NEW) ----------
+    json_log_file = os.path.join(
+        cfg.LOG_DIR,
+        f"gaze_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    )
+    fh_json = logging.FileHandler(json_log_file, encoding="utf-8")
+    fh_json.setLevel(logging.DEBUG)
+    fh_json.setFormatter(JSONLogFormatter())
+
+    # ---------- Register handlers ----------
+    logger.addHandler(ch)
+    logger.addHandler(fh_text)
+    logger.addHandler(fh_json)
+
+    logger.propagate = False
+    return logger
+
+
+logger = setup_debug_logger(config)
+logger.info("Debug logger initialized")
+
 # Create log directory
 if config.ENABLE_LOGGING and not os.path.exists(config.LOG_DIR):
     os.makedirs(config.LOG_DIR)
@@ -301,6 +375,9 @@ class DataLogger:
 # Normal Smooth Gaze Tracker
 class SmoothGazeTracker:
     def __init__(self, config: GazeConfig):
+        self.logger = logger
+        self.logger.info("SmoothGazeTracker initialized")
+
         self.config = config
         # Initialize components
         self.system_monitor = SystemMonitor(config)
@@ -526,13 +603,16 @@ class SmoothGazeTracker:
         return ratio < 0.25
     # ----- Main processing -----
     def process_frame(self, frame):
+        self.logger.debug("Frame processing START")
         """Process frame with normal smooth tracking"""
         results = None
         try:
             # Convert to RGB
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.face_mesh.process(rgb_frame)
-        except Exception:
+        except Exception as e:
+            self.logger.error(f"Frame processing exception: {e}")
+            self.logger.debug(traceback.format_exc())
             # If processing fails, return current smoothed gaze and 0 confidence
             return frame, self.smoothed_gaze_x, self.smoothed_gaze_y, 0.0, {}
         # Default fallback values
@@ -544,6 +624,7 @@ class SmoothGazeTracker:
             self.warning_active = True
             self.warning_timer = time.time()
             confidence = 0.0
+            self.logger.warning("Face not detected in frame")
             # Use smoothed gaze as fallback (so UI doesn't jump)
             return self.draw_and_return_frame_with_warning(frame, confidence)
         # If here, a face is detected — process landmarks
@@ -566,14 +647,19 @@ class SmoothGazeTracker:
             eye_confidence = (left_conf + right_conf) / 2
             raw_gaze_x = (left_raw_x + right_raw_x) / 2
             raw_gaze_y = (left_raw_y + right_raw_y) / 2
+            self.logger.debug(f"Raw gaze: x={raw_gaze_x:.3f}, y={raw_gaze_y:.3f}")
+
             # Compute combined always
             combined_x = eye_gaze_x * self.config.EYE_GAZE_WEIGHT + head_gaze_x * self.config.HEAD_GAZE_WEIGHT
             combined_y = eye_gaze_y * self.config.EYE_GAZE_WEIGHT + head_gaze_y * self.config.HEAD_GAZE_WEIGHT
+            self.logger.debug(f"Combined gaze: x={combined_x:.3f}, y={combined_y:.3f}")
+
             # If irises or eyes missing -> mark confidence 0 and show warning
             if left_iris is None or right_iris is None or len(left_eye) < 6 or len(right_eye) < 6:
                 self.warning_active = True
                 self.warning_timer = time.time()
                 confidence = 0.0
+                self.logger.warning("Eye/Iris detection failed")
                 # Use smoothed gaze as fallback
                 gaze_x, gaze_y = self.smoothed_gaze_x, self.smoothed_gaze_y
             else:
@@ -582,6 +668,7 @@ class SmoothGazeTracker:
             if self.calibrator.is_calibrated:
                 calibrated_x, calibrated_y = self.calibrator.apply_calibration(combined_x, combined_y)
                 temp_gaze_x, temp_gaze_y = calibrated_x, calibrated_y
+                self.logger.debug(f"Calibrated gaze: x={calibrated_x:.3f}, y={calibrated_y:.3f}")
             else:
                 temp_gaze_x, temp_gaze_y = combined_x, combined_y
             # Normal smooth tracking with sensitivity if confidence sufficient
@@ -629,6 +716,7 @@ class SmoothGazeTracker:
                     self.samples_to_collect = self.config.CALIBRATION_SAMPLES_PER_POINT - self.samples_collected_current_point
                     self.sample_collection_start_time = time.time()
                     print(f"Trigger detected! Collecting {self.samples_to_collect} samples for point {self.current_calibration_point + 1}")
+                    self.logger.info(f"Calibration trigger at point {self.current_calibration_point + 1}")
                 # Collect samples continuously, only if triggered
                 if getattr(self, 'collecting_samples', False) and self.samples_to_collect > 0:
                     now = time.time()
@@ -644,11 +732,19 @@ class SmoothGazeTracker:
                     if self.samples_to_collect <= 0:
                         self.collecting_samples = False
                         self.sample_collection_start_time = 0.0
+                        self.logger.debug(
+                            f"Collected sample {self.samples_collected_current_point}/"
+                            f"{self.config.CALIBRATION_SAMPLES_PER_POINT} "
+                            f"for point {self.current_calibration_point + 1}"
+                        )
+
                         # Move to next point
                         if self.samples_collected_current_point >= self.config.CALIBRATION_SAMPLES_PER_POINT:
                             self.current_calibration_point += 1
                             self.samples_collected_current_point = 0
                             self.calibration_point_start_time = 0.0
+                            self.logger.info(f"Moving to calibration point {self.current_calibration_point + 1}")
+
                             # reset ok button rect so next point will create new coordinates
                             self.ok_button_rect = None
                             if self.current_calibration_point >= len(self.config.CALIBRATION_POINTS):
@@ -656,8 +752,10 @@ class SmoothGazeTracker:
                                 success = self.calibrator.compute_calibration_model()
                                 if success:
                                     print("Calibration completed successfully!")
+                                    self.logger.info("Calibration completed successfully")
                                 else:
                                     print("Calibration failed. Please try again.")
+                                    self.logger.error("Calibration failed")
                             else:
                                 print(f"Moving to calibration point {self.current_calibration_point + 1}")
                 # Timeout handling for current point
@@ -702,6 +800,8 @@ class SmoothGazeTracker:
             self.fps = self.frame_count / elapsed if elapsed > 0 else 0
         return frame, gaze_x, gaze_y, confidence, debug_info
     def draw_and_return_frame_with_warning(self, frame, confidence):
+        self.logger.warning("Warning displayed: Face/Eyes not detected")
+
         """Helper to draw warning and return a frame when face/eyes missing"""
         # Use current smoothed gaze to avoid UI jump
         screen_x, screen_y = self.map_normalized_to_screen(self.smoothed_gaze_x, self.smoothed_gaze_y)
