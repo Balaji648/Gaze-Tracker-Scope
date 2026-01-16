@@ -20,6 +20,81 @@ import traceback
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.pipeline import Pipeline
+
+ORIGINAL_STDOUT = sys.stdout
+ORIGINAL_STDERR = sys.stderr
+
+
+# ================= LOGGING SETUP =================
+
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        return json.dumps({
+            "timestamp": datetime.utcnow().isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "module": record.module,
+            "function": record.funcName,
+            "line": record.lineno
+        })
+
+
+logger = logging.getLogger("GazeTrackerDebug")
+logger.setLevel(logging.DEBUG)
+logger.propagate = False
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+
+file_handler = logging.FileHandler("gaze_debug.log")
+file_handler.setLevel(logging.DEBUG)
+
+json_handler = logging.FileHandler("gaze_debug.json")
+json_handler.setLevel(logging.DEBUG)
+
+text_formatter = logging.Formatter(
+    "[%(asctime)s] [%(levelname)s] %(message)s"
+)
+
+console_handler.setFormatter(text_formatter)
+file_handler.setFormatter(text_formatter)
+json_handler.setFormatter(JSONFormatter())
+
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
+logger.addHandler(json_handler)
+
+# Capture python warnings
+logging.captureWarnings(True)
+warnings_logger = logging.getLogger("py.warnings")
+warnings_logger.setLevel(logging.WARNING)
+for h in logger.handlers:
+    warnings_logger.addHandler(h)
+
+# ========== REDIRECT PRINT TO LOGGER ==========
+
+class PrintToLogger:
+    def __init__(self, logger, level=logging.INFO):
+        self.logger = logger
+        self.level = level
+
+    def write(self, message):
+        message = message.strip()
+        if message:
+            # log message
+            self.logger.log(self.level, message)
+            # still show in terminal
+            ORIGINAL_STDOUT.write(message + "\n")
+
+    def flush(self):
+        ORIGINAL_STDOUT.flush()
+
+
+sys.stdout = PrintToLogger(logger, logging.INFO)
+sys.stderr = PrintToLogger(logger, logging.ERROR)
+
+
 # Initialize MediaPipe
 mp_face_mesh = mp.solutions.face_mesh
 mp_drawing = mp.solutions.drawing_utils
@@ -66,25 +141,6 @@ class GazeConfig:
     LOG_DIR = "gaze_logs"
 config = GazeConfig()
 
-class JSONLogFormatter(logging.Formatter):
-    """Custom JSON formatter for debug logs"""
-
-    def format(self, record: logging.LogRecord) -> str:
-        log_entry = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-            "module": record.module,
-            "function": record.funcName,
-            "line": record.lineno,
-        }
-
-        # Add exception info if present
-        if record.exc_info:
-            log_entry["exception"] = self.formatException(record.exc_info)
-
-        return json.dumps(log_entry, ensure_ascii=False)
 
 
 def setup_debug_logger(cfg):
@@ -935,6 +991,7 @@ class SmoothGazeTracker:
         # Prevent calibration if corners not set
         if self.screen_corners is None:
             print("Screen corners not set. Please set corners first (press 's' to start corner setup).")
+            logger.warning("Screen corners not set. Please set corners first (press 's' to start corner setup")
             return
         self.calibrator.start_calibration()
         self.calibrating = True
@@ -962,6 +1019,7 @@ def run_smooth_gaze_tracking():
     cap.set(cv2.CAP_PROP_FPS, config.FPS)
     if not cap.isOpened():
         print("Error: Could not open camera")
+        logger.warning("Error: Could not open camera")
         return
     # Get actual camera properties
     actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -983,6 +1041,7 @@ def run_smooth_gaze_tracking():
         gaze_tracker.ensure_screen_corners_blocking(cap)
     except KeyboardInterrupt:
         print("User aborted corner setup. Exiting.")
+        logger.info("User aborted corner setup. Exiting.")
         cap.release()
         cv2.destroyAllWindows()
         return
@@ -1012,6 +1071,7 @@ def run_smooth_gaze_tracking():
             ret, frame = cap.read()
             if not ret:
                 print("Failed to grab frame")
+                logger.info("Failed to grab frame")
                 break
             # Process frame
             processed_frame, gaze_x, gaze_y, confidence, debug_info = gaze_tracker.process_frame(frame)
@@ -1019,6 +1079,7 @@ def run_smooth_gaze_tracking():
             cv2.imshow(window_name, processed_frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
+                logger.info("Exit requested by user (Q pressed)")
                 break
             elif key == ord('c'):
                 # start calibration
@@ -1032,7 +1093,7 @@ def run_smooth_gaze_tracking():
                 gaze_tracker.gaze_buffer_y = []
                 gaze_tracker.samples_collected_current_point = 0
                 gaze_tracker.calibrating = False
-                print("Calibration reset")
+                logger.info("Calibration reset")
             elif key == ord('l'):
                 logging_enabled = not logging_enabled
                 gaze_tracker.config.ENABLE_LOGGING = logging_enabled
@@ -1041,21 +1102,25 @@ def run_smooth_gaze_tracking():
                 # start screen boundary setup (user clicks four corners)
                 success = gaze_tracker.start_screen_boundary_setup(cap)
                 if success:
-                    print("Screen boundaries set.")
+                    logger.info("Screen boundaries set.")
                 else:
                     print("Screen boundary setup not completed.")
+                    logger.warning("Screen boundary setup not completed.")
             elif key == ord('b'):
                 gaze_tracker.calibration_mode = 'blink'
                 print("Calibration mode set to BLINK.")
+                logger.info("Calibration mode set to BLINK")
             elif key == ord('o'):
                 gaze_tracker.calibration_mode = 'ok'
                 print("Calibration mode set to OK button.")
+                logger.info("Calibration mode set to OK")
             elif key == ord('+') or key == ord('='): # also handle '=' which often shares '+'
-                gaze_tracker.config.CURSOR_SENSITIVITY = min(10, gaze_tracker.config.CURSOR_SENSITIVITY + 1)
-                print(f"Sensitivity increased to {gaze_tracker.config.CURSOR_SENSITIVITY}")
+                config.CURSOR_SENSITIVITY = min(10, config.CURSOR_SENSITIVITY + 1)
+                logger.info(f"Sensitivity increased to {config.CURSOR_SENSITIVITY}")
             elif key == ord('-') or key == ord('_'):
-                gaze_tracker.config.CURSOR_SENSITIVITY = max(1, gaze_tracker.config.CURSOR_SENSITIVITY - 1)
-                print(f"Sensitivity decreased to {gaze_tracker.config.CURSOR_SENSITIVITY}")
+                config.CURSOR_SENSITIVITY = max(1, config.CURSOR_SENSITIVITY - 1)
+                logger.info(f"Sensitivity decreased to {config.CURSOR_SENSITIVITY}")
+
     except KeyboardInterrupt:
         print("\nStopping...")
     except Exception as e:
